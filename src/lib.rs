@@ -22,7 +22,7 @@
 use crate::calibration::{calculate_calibration, calibration_draw_point};
 pub use crate::{
     calibration::CalibrationPoint,
-    error::{BusError, Error},
+    error::Error,
     exti_pin::Xpt2046Exti,
 };
 use core::{fmt::Debug, ops::RemAssign};
@@ -30,7 +30,7 @@ use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 
 #[cfg(feature = "with_defmt")]
 use defmt::Format;
-use embedded_hal::{delay::DelayNs, digital::OutputPin, spi::SpiDevice};
+use embedded_hal::{delay::DelayNs, spi::SpiDevice};
 
 pub mod calibration;
 pub mod error;
@@ -40,7 +40,6 @@ const CHANNEL_SETTING_X: u8 = 0b10010000;
 const CHANNEL_SETTING_Y: u8 = 0b11010000;
 
 const MAX_SAMPLES: usize = 128;
-const TX_BUFF_LEN: usize = 5;
 
 #[cfg_attr(feature = "with_defmt", derive(Format))]
 #[derive(Debug)]
@@ -176,17 +175,11 @@ impl TouchSamples {
 }
 
 #[derive(Debug)]
-pub struct Xpt2046<SPI, CS, PinIRQ> {
+pub struct Xpt2046<SPI, PinIRQ> {
     /// THe SPI interface
     spi: SPI,
-    /// Control pin
-    cs: CS,
     /// Interrupt control pin
     irq: PinIRQ,
-    /// Internall buffers tx
-    tx_buff: [u8; TX_BUFF_LEN],
-    /// Internal buffer for rx
-    rx_buff: [u8; TX_BUFF_LEN],
     /// Current driver state
     screen_state: TouchScreenState,
     /// Buffer for the touch data samples
@@ -198,19 +191,15 @@ pub struct Xpt2046<SPI, CS, PinIRQ> {
     calibration_point: CalibrationPoint,
 }
 
-impl<SPI, CS, PinIRQ> Xpt2046<SPI, CS, PinIRQ>
+impl<SPI, PinIRQ> Xpt2046<SPI, PinIRQ>
 where
     SPI: SpiDevice,
-    CS: OutputPin,
     PinIRQ: Xpt2046Exti,
 {
-    pub fn new(spi: SPI, cs: CS, irq: PinIRQ, orientation: Orientation) -> Self {
+    pub fn new(spi: SPI, irq: PinIRQ, orientation: Orientation) -> Self {
         Self {
             spi,
-            cs,
             irq,
-            tx_buff: [0; TX_BUFF_LEN],
-            rx_buff: [0; TX_BUFF_LEN],
             screen_state: TouchScreenState::IDLE,
             ts: TouchSamples::default(),
             calibration_data: orientation.calibration_data(),
@@ -220,38 +209,39 @@ where
     }
 }
 
-impl<SPI, CS, PinIRQ, SPIError, CSError> Xpt2046<SPI, CS, PinIRQ>
+impl<SPI, PinIRQ, SPIError> Xpt2046<SPI, PinIRQ>
 where
     SPI: SpiDevice<Error = SPIError>,
-    CS: OutputPin<Error = CSError>,
     PinIRQ: Xpt2046Exti,
     SPIError: Debug,
-    CSError: Debug,
 {
-    fn spi_read(&mut self) -> Result<(), Error<BusError<SPIError, CSError>>> {
-        self.cs
-            .set_low()
-            .map_err(|e| Error::Bus(BusError::Pin(e)))?;
+    fn spi_read(&mut self, buf: &mut [u8]) -> Result<(), Error<SPIError>> {
         self.spi
-            .transfer(&mut self.rx_buff, &self.tx_buff)
-            .map_err(|e| Error::Bus(BusError::Spi(e)))?;
-        self.cs
-            .set_high()
-            .map_err(|e| Error::Bus(BusError::Pin(e)))?;
+            .transfer_in_place(buf)
+            .map_err(|e| Error::Spi(e))?;
         Ok(())
     }
 
     /// Read raw values from the XPT2046 driver
-    fn read_xy(&mut self) -> Result<Point, Error<BusError<SPIError, CSError>>> {
-        self.spi_read()?;
+    fn read_xy(&mut self) -> Result<Point, Error<SPIError>> {
+        let mut buff = [
+            CHANNEL_SETTING_X >> 3,
+            CHANNEL_SETTING_X << 5,
+            CHANNEL_SETTING_Y >> 3,
+            CHANNEL_SETTING_Y << 5,
+            0,
+        ];
 
-        let x = (self.rx_buff[1] as i32) << 8 | self.rx_buff[2] as i32;
-        let y = (self.rx_buff[3] as i32) << 8 | self.rx_buff[4] as i32;
+        self.spi_read(&mut buff)?;
+
+        let x = (buff[1] as i32) << 8 | buff[2] as i32;
+        let y = (buff[3] as i32) << 8 | buff[4] as i32;
+
         Ok(Point::new(x, y))
     }
 
     /// Read the calibrated point of touch from XPT2046
-    fn read_touch_point(&mut self) -> Result<Point, Error<BusError<SPIError, CSError>>> {
+    fn read_touch_point(&mut self) -> Result<Point, Error<SPIError>> {
         let raw_point = self.read_xy()?;
 
         let (x, y) = match self.operation_mode {
@@ -294,25 +284,10 @@ where
     pub fn init<D: DelayNs>(
         &mut self,
         delay: &mut D,
-    ) -> Result<(), Error<BusError<SPIError, CSError>>> {
-        self.tx_buff[0] = 0x80;
-        self.cs.set_high()?;
-        self.spi_read()?;
+    ) -> Result<(), Error<SPIError>> {
+        self.spi_read(& mut [0x80, 0, 0, 0, 0])?;
         delay.delay_ms(1);
 
-        /*
-         * Load the tx_buffer with the channels config
-         * for all subsequent reads
-         * The byte shifting provides padding to align the read bytes with the
-         * DCLK. XPT2046 datasheet figure 12
-         */
-        self.tx_buff = [
-            CHANNEL_SETTING_X >> 3,
-            CHANNEL_SETTING_X << 5,
-            CHANNEL_SETTING_Y >> 3,
-            CHANNEL_SETTING_Y << 5,
-            0,
-        ];
         Ok(())
     }
 
@@ -322,7 +297,7 @@ where
     pub fn run(
         &mut self,
         exti: &mut PinIRQ::Exti,
-    ) -> Result<(), Error<BusError<SPIError, CSError>>> {
+    ) -> Result<(), Error<SPIError>> {
         match self.screen_state {
             TouchScreenState::IDLE => {
                 if self.operation_mode == TouchScreenOperationMode::CALIBRATION && self.irq.is_low()
@@ -397,7 +372,7 @@ where
         dt: &mut DT,
         delay: &mut DELAY,
         exti: &mut PinIRQ::Exti,
-    ) -> Result<(), Error<BusError<SPIError, CSError>>>
+    ) -> Result<(), Error<SPIError>>
     where
         DT: DrawTarget<Color = Rgb565>,
         DELAY: DelayNs,
